@@ -1,0 +1,7 @@
+seed.json
+perf-history.json
+*.db
+*.db-*
+data/
+__pycache__/
+.DS_Store
