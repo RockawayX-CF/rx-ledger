@@ -33,9 +33,32 @@ browser ──GET /──────────────► server.py ─�
 | `page/ledger.html` | Page source (same page as the claude.ai version) |
 | `page/shim.js` | Small adapter that points the page at `server.py` |
 | `build.py` | `page/` → `index.html` (also strips the wallet-address field) |
+| `run.sh` | Start the server from the clone with local `.env` settings |
 | `install-user.sh` | Install without sudo: systemd user service, or cron keep-alive |
 | `install.sh` | Install as root with a systemd service |
 | `tools/import-history.py` | One-off load of NAV + benchmark history into the database |
+
+## Run in screen
+
+From the clone, create `.env` once. If `install-user.sh` already set up the ledger
+under this account, use its configuration to keep the same VPN address and database:
+
+```sh
+[ -f .env ] || cp ~/.local/share/rx-ledger/env .env
+```
+
+For a fresh setup, copy `.env.example` to `.env` and edit it. Set `RX_HOST` to the
+server's VPN IP for remote access. To reuse a database from another installation,
+set `RX_DATA_DIR` to the directory containing `ledger.db`. Use shell assignments in
+`.env` and quote paths with spaces.
+
+Stop any previous instance and its supervisor before starting the ledger in the attached screen:
+
+```sh
+./run.sh
+```
+
+Press **Ctrl+A, then D** to detach.
 
 ## Install (company server, no sudo)
 
