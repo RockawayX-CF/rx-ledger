@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """RockawayX liquid book ledger: serves the page and stores its documents in SQLite.
 
-Standard library only. Binds to RX_HOST (meant to be the VPN address, e.g. the Tailscale IP),
+Loads a local .env if present. Binds to RX_HOST (meant to be the VPN address, e.g. the Tailscale IP),
 so nothing is reachable from the public internet. No login: the VPN is the access control.
 
 API (all JSON):
@@ -15,10 +15,16 @@ import json, os, queue, re, sqlite3, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+APP_DIR = Path(__file__).resolve().parent
+env_file = APP_DIR / ".env"
+if env_file.is_file():
+    from dotenv import load_dotenv
+
+    load_dotenv(env_file)
+
 HOST = os.environ.get("RX_HOST", "127.0.0.1")
 PORT = int(os.environ.get("RX_PORT", "8787"))
 DATA_DIR = Path(os.environ.get("RX_DATA_DIR", "./data"))
-APP_DIR = Path(__file__).resolve().parent
 # Extra hostnames the page may be opened under (e.g. the Tailscale MagicDNS name), comma-separated.
 EXTRA_HOSTS = {h.strip().lower() for h in os.environ.get("RX_ALLOWED_HOSTS", "").split(",") if h.strip()}
 BACKUP_KEEP = int(os.environ.get("RX_BACKUP_KEEP", "30"))

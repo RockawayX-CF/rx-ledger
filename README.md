@@ -16,7 +16,8 @@ browser ──GET /──────────────► server.py ─�
         ◄─GET /api/events (SSE)─          (live updates)
 ```
 
-- `server.py`: Python standard library only (3.8+), no pip packages. Listens on one address and port.
+- `server.py` runs on Python 3.8 or newer and listens on one address and port.
+  Manual launches with a local `.env` use `python-dotenv`. Installed services supply settings through the environment.
 - All calculations happen in the browser; the server only stores and returns records.
 - Collections: `positions`, `loans`, `plans`, `settings`. `settings` also holds the NAV/benchmark months
   (`perf-YYYY-MM`) and notes (`note-<id>`).
@@ -33,15 +34,23 @@ browser ──GET /──────────────► server.py ─�
 | `page/ledger.html` | Page source (same page as the claude.ai version) |
 | `page/shim.js` | Small adapter that points the page at `server.py` |
 | `build.py` | `page/` → `index.html` (also strips the wallet-address field) |
-| `run.sh` | Start the server from the clone with local `.env` settings |
+| `requirements.txt` | Dependency for local `.env` loading |
 | `install-user.sh` | Install without sudo: systemd user service, or cron keep-alive |
 | `install.sh` | Install as root with a systemd service |
 | `tools/import-history.py` | One-off load of NAV + benchmark history into the database |
 
 ## Run in screen
 
-From the clone, create `.env` once. If `install-user.sh` already set up the ledger
-under this account, use its configuration to keep the same VPN address and database:
+Set up the virtual environment once from the clone.
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
+If `install-user.sh` already set up the ledger under this account, copy its configuration
+to `.env` to keep the same VPN address and database.
 
 ```sh
 [ -f .env ] || cp ~/.local/share/rx-ledger/env .env
@@ -49,13 +58,14 @@ under this account, use its configuration to keep the same VPN address and datab
 
 For a fresh setup, copy `.env.example` to `.env` and edit it. Set `RX_HOST` to the
 server's VPN IP for remote access. To reuse a database from another installation,
-set `RX_DATA_DIR` to the directory containing `ledger.db`. Use shell assignments in
-`.env` and quote paths with spaces.
+set `RX_DATA_DIR` to the directory containing `ledger.db`. The server loads `.env`
+from the script's directory. Existing environment variables take precedence.
 
-Stop any previous instance and its supervisor before starting the ledger in the attached screen:
+Stop any previous instance and its supervisor before starting the ledger in the attached screen.
 
 ```sh
-./run.sh
+. .venv/bin/activate
+python3 server.py
 ```
 
 Press **Ctrl+A, then D** to detach.
