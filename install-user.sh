@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs the ledger under your own account (no sudo).
-#   RX_HOST=10.137.203.5 RX_ALLOWED_HOSTS=traderplayground ./install-user.sh
+#   SCRIPT_OWNER=<owner> RX_HOST=10.137.203.5 RX_ALLOWED_HOSTS=traderplayground ./install-user.sh
 # Runs as a systemd user service when possible; otherwise a cron job keeps it running.
 # Reinstalling keeps your data: seed.json only loads into an empty database.
 set -euo pipefail
@@ -8,24 +8,34 @@ set -euo pipefail
 HOST="${RX_HOST:?Set RX_HOST to the address to listen on, e.g. RX_HOST=10.137.203.5}"
 PORT="${RX_PORT:-8787}"
 EXTRA="${RX_ALLOWED_HOSTS:-}"
+OWNER="${SCRIPT_OWNER:?Set SCRIPT_OWNER to the lower-case owner of this deployment}"
+INSTANCE="${LOG_INSTANCE:-main}"
+for value in "$OWNER" "$INSTANCE"; do
+  [[ "$value" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || { echo "Invalid SCRIPT_OWNER or LOG_INSTANCE" >&2; exit 1; }
+done
 SRC="$(cd "$(dirname "$0")" && pwd)"
 APP="$HOME/.local/share/rx-ledger"
 DATA="$APP/data"
-PY="$(command -v python3)"
+PY="$APP/.venv/bin/python"
 
 mkdir -p "$APP" "$DATA"
 chmod 700 "$APP" "$DATA"
-install -m 644 "$SRC/server.py" "$SRC/index.html" "$APP/"
+python3 -m venv "$APP/.venv"
+"$PY" -m pip install -r "$SRC/requirements.txt"
+install -m 644 "$SRC/server.py" "$SRC/logger_utils.py" "$SRC/index.html" "$APP/"
 [ -f "$SRC/seed.json" ] && install -m 600 "$SRC/seed.json" "$APP/seed.json"
 cat > "$APP/env" <<ENV
 RX_HOST=$HOST
 RX_PORT=$PORT
 RX_DATA_DIR=$DATA
 RX_ALLOWED_HOSTS=$EXTRA
+SCRIPT_OWNER=$OWNER
+LOG_INSTANCE=$INSTANCE
 ENV
 cat > "$APP/run.sh" <<RUN
 #!/usr/bin/env bash
 set -a; . "$APP/env"; set +a
+export LOG_MODE="\${LOG_MODE:-jsonl}" LOG_CONSOLE="\${LOG_CONSOLE:-false}"
 exec "$PY" "$APP/server.py"
 RUN
 chmod 700 "$APP/run.sh"
@@ -40,6 +50,10 @@ Description=RockawayX liquid book ledger
 
 [Service]
 ExecStart=$APP/run.sh
+Environment=LOG_MODE=journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rx-ledger.server.$INSTANCE
 Restart=always
 RestartSec=5
 
@@ -82,5 +96,6 @@ echo "Data: $DATA/ledger.db   Daily backups: $DATA/backups (last 30 kept)"
 if [ "$started" = "systemd" ]; then
   echo "Logs: journalctl --user -u rx-ledger -f    Restart: systemctl --user restart rx-ledger"
 else
-  echo "Logs: tail -f $DATA/server.log    Restart: pkill -f $APP/[s]erver.py  (cron starts it again within a minute)"
+  echo "Logs: /var/log/trading/$USER/rx-ledger/server/$INSTANCE/    Stderr fallback: $DATA/server.log"
+  echo "Restart: pkill -f $APP/[s]erver.py  (cron starts it again within a minute)"
 fi

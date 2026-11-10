@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs the RockawayX ledger as a systemd service that listens only on the VPN address.
-# Run as root from the unpacked folder:   sudo ./install.sh
+# Set SCRIPT_OWNER to the person or team responsible for the deployment.
 # Options (environment):
 #   RX_HOST=100.x.y.z   bind to this address instead of the detected Tailscale IP
 #                       (use 127.0.0.1 when a reverse proxy such as Caddy sits in front)
@@ -12,6 +12,11 @@ APP=/opt/rx-ledger
 DATA=/var/lib/rx-ledger
 SVC=rx-ledger
 PORT="${RX_PORT:-8787}"
+OWNER="${SCRIPT_OWNER:?Set SCRIPT_OWNER to the lower-case owner of this deployment}"
+INSTANCE="${LOG_INSTANCE:-main}"
+for value in "$OWNER" "$INSTANCE"; do
+  [[ "$value" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || { echo "Invalid SCRIPT_OWNER or LOG_INSTANCE" >&2; exit 1; }
+done
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
 [ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo ./install.sh"; exit 1; }
@@ -44,7 +49,9 @@ echo "Binding to $HOST:$PORT"
 id -u rxledger >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin rxledger
 install -d -m 755 "$APP"
 install -d -m 750 -o rxledger -g rxledger "$DATA"
-install -m 644 "$SRC/server.py" "$SRC/index.html" "$APP/"
+python3 -m venv "$APP/.venv"
+"$APP/.venv/bin/python" -m pip install -r "$SRC/requirements.txt"
+install -m 644 "$SRC/server.py" "$SRC/logger_utils.py" "$SRC/index.html" "$APP/"
 # seed.json is imported only into an empty database, so reinstalling never overwrites your edits
 [ -f "$SRC/seed.json" ] && install -m 640 -o root -g rxledger "$SRC/seed.json" "$APP/seed.json"
 
@@ -62,7 +69,13 @@ Environment=RX_HOST=$HOST
 Environment=RX_PORT=$PORT
 Environment=RX_DATA_DIR=$DATA
 Environment=RX_ALLOWED_HOSTS=$EXTRA
-ExecStart=/usr/bin/python3 $APP/server.py
+Environment=SCRIPT_OWNER=$OWNER
+Environment=LOG_MODE=journal
+Environment=LOG_INSTANCE=$INSTANCE
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rx-ledger.server.$INSTANCE
+ExecStart=$APP/.venv/bin/python $APP/server.py
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

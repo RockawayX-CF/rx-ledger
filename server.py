@@ -11,35 +11,46 @@ API (all JSON):
   DELETE /api/doc/<coll>/<id>       delete a document
   GET    /api/events                server-sent events, one per change: {"coll", "id", "data" | null}
 """
-import json, os, queue, re, sqlite3, threading, time
+import json, os, queue, re, sqlite3, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from logger_utils import (
+    SigtermReceived, emit_logging_initialization_failure, install_sigterm_handler,
+    logger as log, resolve_script_owner, restore_sigterm_handler, setup_logger,
+    shutdown_logger,
+)
+
 APP_DIR = Path(__file__).resolve().parent
-env_file = APP_DIR / ".env"
-if env_file.is_file():
-    from dotenv import load_dotenv
-
-    load_dotenv(env_file)
-
-HOST = os.environ.get("RX_HOST", "127.0.0.1")
-PORT = int(os.environ.get("RX_PORT", "8787"))
-DATA_DIR = Path(os.environ.get("RX_DATA_DIR", "./data"))
-# Extra hostnames the page may be opened under (e.g. the Tailscale MagicDNS name), comma-separated.
-EXTRA_HOSTS = {h.strip().lower() for h in os.environ.get("RX_ALLOWED_HOSTS", "").split(",") if h.strip()}
-BACKUP_KEEP = int(os.environ.get("RX_BACKUP_KEEP", "30"))
+REPOSITORY = SERVICE_NAME = "rx-ledger"
+RUNTIME = "server"
 
 COLLECTIONS = {"positions", "loans", "settings", "plans"}
 ID_RE = re.compile(r"^[A-Za-z0-9_\-.~:@+]{1,200}$")
 MAX_BODY = 256 * 1024
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "ledger.db"
 _db_lock = threading.Lock()
-_db = sqlite3.connect(DB_PATH, check_same_thread=False)
-_db.execute("PRAGMA journal_mode=WAL")
-_db.execute("CREATE TABLE IF NOT EXISTS docs (coll TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY (coll, id))")
-_db.commit()
+
+
+def configure():
+    global HOST, PORT, DATA_DIR, EXTRA_HOSTS, BACKUP_KEEP
+
+    HOST = os.environ.get("RX_HOST", "127.0.0.1")
+    PORT = int(os.environ.get("RX_PORT", "8787"))
+    DATA_DIR = Path(os.environ.get("RX_DATA_DIR", "./data"))
+    # Extra hostnames the page may be opened under (e.g. the Tailscale MagicDNS name), comma-separated.
+    EXTRA_HOSTS = {h.strip().lower() for h in os.environ.get("RX_ALLOWED_HOSTS", "").split(",") if h.strip()}
+    BACKUP_KEEP = int(os.environ.get("RX_BACKUP_KEEP", "30"))
+
+
+def open_database():
+    global _db
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _db = sqlite3.connect(DATA_DIR / "ledger.db", check_same_thread=False)
+    _db.execute("PRAGMA journal_mode=WAL")
+    _db.execute("CREATE TABLE IF NOT EXISTS docs (coll TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY (coll, id))")
+    _db.commit()
 
 
 def import_seed():
@@ -55,7 +66,8 @@ def import_seed():
                 for doc_id, body in docs.items():
                     _db.execute("INSERT INTO docs VALUES (?,?,?,?)", (coll, doc_id, json.dumps(body), now))
         _db.commit()
-        print(f"Imported seed.json: {sum(len(v) for v in data.values())} documents", flush=True)
+        count = sum(len(docs) for coll, docs in data.items() if coll in COLLECTIONS)
+        log.bind(event="seed_imported", document_count=count).info("Imported seed.json: {} documents", count)
 
 
 def all_docs():
@@ -105,25 +117,31 @@ def broadcast(event):
 
 # ---- daily backups ----
 def backup_loop():
-    bdir = DATA_DIR / "backups"
-    bdir.mkdir(exist_ok=True)
-    while True:
-        target = bdir / time.strftime("ledger-%Y%m%d.db")
-        if not target.exists():
-            with _db_lock:
-                dst = sqlite3.connect(target)
-                _db.backup(dst)
-                dst.close()
-            for old in sorted(bdir.glob("ledger-*.db"))[:-BACKUP_KEEP]:
-                old.unlink()
-        time.sleep(3600)
+    try:
+        bdir = DATA_DIR / "backups"
+        bdir.mkdir(exist_ok=True)
+        while True:
+            target = bdir / time.strftime("ledger-%Y%m%d.db")
+            if not target.exists():
+                with _db_lock:
+                    dst = sqlite3.connect(target)
+                    _db.backup(dst)
+                    dst.close()
+                for old in sorted(bdir.glob("ledger-*.db"))[:-BACKUP_KEEP]:
+                    old.unlink()
+                log.bind(event="backup_completed").info("Daily ledger backup completed")
+            else:
+                log.bind(event="process_heartbeat").info("Ledger backup worker is running")
+            time.sleep(3600)
+    except Exception:
+        log.bind(event="backup_failed").exception("Ledger backup worker stopped")
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "rx-ledger"
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, fmt, *args):  # quiet: only errors reach the journal
+    def log_message(self, fmt, *args):  # Keep routine HTTP requests quiet.
         pass
 
     # Requests must name this server; blocks DNS-rebinding pages from reaching the API.
@@ -231,10 +249,65 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, {"ok": True})
 
 
+class LedgerServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        log.bind(event="request_failed", error_type=type(error).__name__).error("Ledger request failed")
+
+
+def main() -> int:
+    env_file = APP_DIR / ".env"
+    if env_file.is_file():
+        from dotenv import load_dotenv
+
+        load_dotenv(env_file)
+
+    level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    try:
+        owner = resolve_script_owner()
+        log.level(level)
+    except ValueError as error:
+        emit_logging_initialization_failure(
+            repository=REPOSITORY, service_name=SERVICE_NAME, runtime=RUNTIME,
+            log_level=level, error=error,
+        )
+        return 2
+    try:
+        setup_logger(RUNTIME, level, repository=REPOSITORY, service_name=SERVICE_NAME, script_owner=owner)
+    except Exception:
+        return 2
+
+    previous = install_sigterm_handler()
+    try:
+        log.bind(event="process_started").info("RX Ledger started")
+        try:
+            configure()
+        except ValueError as error:
+            log.bind(event="configuration_invalid", error_type=type(error).__name__).error(
+                "Invalid ledger configuration"
+            )
+            return 2
+        open_database()
+        import_seed()
+        threading.Thread(target=backup_loop, daemon=True).start()
+        with LedgerServer((HOST, PORT), Handler) as httpd:
+            log.bind(event="server_listening", bind_port=httpd.server_port).info(
+                "rx-ledger listening on http://{}:{}", HOST, httpd.server_port
+            )
+            httpd.serve_forever()
+    except SigtermReceived:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except Exception:
+        log.bind(event="process_crashed").exception("RX Ledger failed")
+        return 1
+    finally:
+        log.bind(event="process_stopping").info("RX Ledger stopping")
+        shutdown_logger()
+        restore_sigterm_handler(previous)
+    return 0
+
+
 if __name__ == "__main__":
-    import_seed()
-    threading.Thread(target=backup_loop, daemon=True).start()
-    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    httpd.daemon_threads = True
-    print(f"rx-ledger listening on http://{HOST}:{PORT}", flush=True)
-    httpd.serve_forever()
+    raise SystemExit(main())

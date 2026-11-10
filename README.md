@@ -17,7 +17,7 @@ browser ──GET /──────────────► server.py ─�
 ```
 
 - `server.py` runs on Python 3.8 or newer and listens on one address and port.
-  Manual launches with a local `.env` use `python-dotenv`. Installed services supply settings through the environment.
+  It uses the UnderQuant Loguru setup. Installed services supply settings through the environment.
 - All calculations happen in the browser; the server only stores and returns records.
 - Collections: `positions`, `loans`, `plans`, `settings`. `settings` also holds the NAV/benchmark months
   (`perf-YYYY-MM`) and notes (`note-<id>`).
@@ -34,7 +34,7 @@ browser ──GET /──────────────► server.py ─�
 | `page/ledger.html` | Page source (same page as the claude.ai version) |
 | `page/shim.js` | Small adapter that points the page at `server.py` |
 | `build.py` | `page/` → `index.html` (also strips the wallet-address field) |
-| `requirements.txt` | Dependency for local `.env` loading |
+| `requirements.txt` | Logging and local `.env` dependencies |
 | `install-user.sh` | Install without sudo: systemd user service, or cron keep-alive |
 | `install.sh` | Install as root with a systemd service |
 | `tools/import-history.py` | One-off load of NAV + benchmark history into the database |
@@ -60,6 +60,7 @@ For a fresh setup, copy `.env.example` to `.env` and edit it. Set `RX_HOST` to t
 server's VPN IP for remote access. To reuse a database from another installation,
 set `RX_DATA_DIR` to the directory containing `ledger.db`. The server loads `.env`
 from the script's directory. Existing environment variables take precedence.
+Set `SCRIPT_OWNER` and the screen logging settings below before launch.
 
 Stop any previous instance and its supervisor before starting the ledger in the attached screen.
 
@@ -70,11 +71,36 @@ python3 server.py
 
 Press **Ctrl+A, then D** to detach.
 
+## Logging
+
+This uses the UnderQuant logger from `underquant_agent/agent_controller/logger_utils.py`.
+The repository and service are `rx-ledger`, and the runtime is `server`.
+Set `SCRIPT_OWNER` to the lower-case person or team responsible for the deployment.
+Local runs use the UnderQuant human-readable console by default.
+
+For the `honza` screen deployment on `traderplayground`, set these in `.env`:
+
+```dotenv
+LOG_MODE=jsonl
+LOG_INSTANCE=playground
+LOG_CONSOLE=true
+```
+
+Use a distinct `LOG_INSTANCE` for each concurrent ledger and a screen name such as
+`rx_ledger_playground`. Alloy matches
+`/var/log/trading/honza/rx-ledger/server/playground/<run_id>.<segment>.jsonl`.
+The installers persist `SCRIPT_OWNER` from the shell, use the journal under systemd
+with identifier `rx-ledger.server.<instance>`, and use JSONL for the cron fallback.
+
+Events include the PID, run ID, and screen name when available. The backup worker
+emits a backup success or heartbeat about once an hour. Routine HTTP requests stay
+quiet. The `docs` table in `ledger.db` is the source of truth for ledger records.
+
 ## Install (company server, no sudo)
 
 ```bash
 git clone git@github.com:<you>/rx-ledger.git ~/rx-ledger && cd ~/rx-ledger
-RX_HOST=10.137.203.5 RX_ALLOWED_HOSTS=traderplayground ./install-user.sh
+SCRIPT_OWNER=your-owner RX_HOST=10.137.203.5 RX_ALLOWED_HOSTS=traderplayground ./install-user.sh
 ```
 
 Then open `http://10.137.203.5:8787`. App files and data live in `~/.local/share/rx-ledger/`.
@@ -91,12 +117,12 @@ python3 tools/import-history.py ~/perf-history.json
 
 ```bash
 cd ~/rx-ledger && git pull
-cp index.html ~/.local/share/rx-ledger/index.html          # page only: takes effect on reload
-# if server.py changed too:
-cp server.py ~/.local/share/rx-ledger/ && pkill -f '.local/share/rx-ledger/[s]erver.py'   # cron restarts it within a minute
+cp index.html ~/.local/share/rx-ledger/index.html  # page only, takes effect on reload
 ```
 
-Data is never touched by an update.
+For an installed copy, rerun the same installer with its existing configuration
+when Python files or dependencies change. For a screen launch from the clone,
+update the virtual environment from `requirements.txt` and restart the server.
 
 ## Change the page
 
@@ -104,7 +130,7 @@ Edit `page/ledger.html`, run `python3 build.py`, commit both `page/` and `index.
 To try it locally against a throwaway database:
 
 ```bash
-RX_HOST=127.0.0.1 RX_DATA_DIR=/tmp/rx python3 server.py   # then open http://127.0.0.1:8787
+SCRIPT_OWNER=your-owner RX_HOST=127.0.0.1 RX_DATA_DIR=/tmp/rx python3 server.py
 ```
 
 ## Day to day
@@ -112,7 +138,7 @@ RX_HOST=127.0.0.1 RX_DATA_DIR=/tmp/rx python3 server.py   # then open http://127
 | Task | Command |
 |---|---|
 | Is it running? | `pgrep -af '[s]erver.py'` |
-| Logs | `tail -f ~/.local/share/rx-ledger/data/server.log` |
+| Logs | Read the journal for a service or the instance’s JSONL files for screen and cron |
 | Restart | `pkill -f '.local/share/rx-ledger/[s]erver.py'` (cron starts it within a minute) |
 | Copy of the database | `cp ~/.local/share/rx-ledger/data/ledger.db ~/ledger-$(date +%F).db` |
 | Restore a backup | stop it as above, then `cp data/backups/ledger-YYYYMMDD.db data/ledger.db && rm -f data/ledger.db-wal data/ledger.db-shm` (in `~/.local/share/rx-ledger`); cron restarts it |
