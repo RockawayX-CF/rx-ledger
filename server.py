@@ -87,6 +87,54 @@ class SqliteStore:
         return target.name
 
 
+# Change history (Postgres only): a trigger appends every insert, update and delete on docs to docs_history,
+# so the ledger can be rebuilt as it was at any moment with ledger_at(timestamp). Rows are never changed or
+# deleted. The first start adds one 'baseline' row per existing document, so history starts complete.
+HISTORY_SQL = """
+CREATE TABLE IF NOT EXISTS docs_history (
+    change_id  bigserial PRIMARY KEY,
+    changed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    op         text NOT NULL,                 -- baseline | insert | update | delete
+    coll       text NOT NULL,
+    id         text NOT NULL,
+    data       jsonb,                         -- the document after the change; NULL for delete
+    source     text DEFAULT current_setting('application_name', true)  -- rx-ledger = the page, rx-ledger-load = a load/restore
+);
+CREATE INDEX IF NOT EXISTS docs_history_doc ON docs_history (coll, id, change_id);
+CREATE INDEX IF NOT EXISTS docs_history_time ON docs_history (changed_at);
+
+CREATE OR REPLACE FUNCTION docs_log_change() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        INSERT INTO docs_history (op, coll, id, data) VALUES ('delete', OLD.coll, OLD.id, NULL);
+        RETURN OLD;
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW.data = OLD.data THEN
+        RETURN NEW;                           -- saved without any change: nothing to record
+    END IF;
+    INSERT INTO docs_history (op, coll, id, data) VALUES (lower(TG_OP), NEW.coll, NEW.id, NEW.data);
+    RETURN NEW;
+END
+$fn$;
+
+CREATE OR REPLACE TRIGGER docs_history_log AFTER INSERT OR UPDATE OR DELETE ON docs
+    FOR EACH ROW EXECUTE FUNCTION docs_log_change();
+
+INSERT INTO docs_history (op, coll, id, data)
+    SELECT 'baseline', coll, id, data FROM docs WHERE NOT EXISTS (SELECT 1 FROM docs_history);
+
+-- Every document as it was at ts:  SELECT * FROM ledger_at('2026-11-30 18:00+01');
+CREATE OR REPLACE FUNCTION ledger_at(ts timestamptz) RETURNS TABLE (coll text, id text, data jsonb)
+LANGUAGE sql STABLE AS $fn$
+    SELECT h.coll, h.id, h.data FROM (
+        SELECT DISTINCT ON (dh.coll, dh.id) dh.coll, dh.id, dh.data, dh.op
+        FROM docs_history dh WHERE dh.changed_at <= ts
+        ORDER BY dh.coll, dh.id, dh.change_id DESC
+    ) h WHERE h.op <> 'delete';
+$fn$;
+"""
+
+
 class PostgresStore:
     """Used when RX_DATABASE_URL is set. The password comes from ~/.pgpass or PGPASSWORD, not the URL."""
     kind = "postgres"
@@ -101,6 +149,8 @@ class PostgresStore:
         self._run(lambda c: c.execute(
             "CREATE TABLE IF NOT EXISTS snapshots (week text PRIMARY KEY, taken_at timestamptz NOT NULL DEFAULT now(), "
             "doc_count integer NOT NULL, data jsonb NOT NULL)"))
+        self._run(lambda c: c.execute(HISTORY_SQL))
+
 
     def _run(self, fn):
         # One connection, used under _db_lock. Reconnect once if the database restarted or the link dropped;
