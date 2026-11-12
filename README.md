@@ -23,7 +23,8 @@ browser ──GET /──────────────► server.py ─�
   (`perf-YYYY-MM`) and notes (`note-<id>`).
 - The server answers only requests addressed to its own host name/IP (`RX_HOST`, `RX_ALLOWED_HOSTS`),
   which blocks DNS-rebinding pages. There is no login: keep it on a VPN-only address.
-- Daily backups to `data/backups/`, last 30 kept.
+- Weekly backups to `data/backups/ledger-YYYY-Www.db` (ISO week), taken in the first hour the server runs
+  each week. Every backup is kept; nothing is deleted automatically.
 
 ## Layout
 
@@ -141,7 +142,7 @@ SCRIPT_OWNER=your-owner RX_HOST=127.0.0.1 RX_DATA_DIR=/tmp/rx python3 server.py
 | Logs | Read the journal for a service or the instance’s JSONL files for screen and cron |
 | Restart | `pkill -f '.local/share/rx-ledger/[s]erver.py'` (cron starts it within a minute) |
 | Copy of the database | `cp ~/.local/share/rx-ledger/data/ledger.db ~/ledger-$(date +%F).db` |
-| Restore a backup | stop it as above, then `cp data/backups/ledger-YYYYMMDD.db data/ledger.db && rm -f data/ledger.db-wal data/ledger.db-shm` (in `~/.local/share/rx-ledger`); cron restarts it |
+| Restore a backup | stop it as above, then `cp data/backups/ledger-YYYY-Www.db data/ledger.db && rm -f data/ledger.db-wal data/ledger.db-shm` (in `~/.local/share/rx-ledger`); cron restarts it |
 
 Kept per browser only (not on the server): scenarios, loop calculators, whether the time series is open.
 

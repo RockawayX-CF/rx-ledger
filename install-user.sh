@@ -92,7 +92,7 @@ fi
 
 echo
 echo "Ledger is running on http://$HOST:$PORT  (kept alive by $started)"
-echo "Data: $DATA/ledger.db   Daily backups: $DATA/backups (last 30 kept)"
+echo "Data: $DATA/ledger.db   Weekly backups: $DATA/backups (all kept)"
 if [ "$started" = "systemd" ]; then
   echo "Logs: journalctl --user -u rx-ledger -f    Restart: systemctl --user restart rx-ledger"
 else
