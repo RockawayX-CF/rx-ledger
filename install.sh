@@ -6,6 +6,8 @@
 #                       (use 127.0.0.1 when a reverse proxy such as Caddy sits in front)
 #   RX_ALLOWED_HOSTS=a,b hostnames the page is opened under (e.g. ledger.1-2-3-4.sslip.io behind Caddy)
 #   RX_PORT=8787        port to listen on
+#   RX_DATABASE_URL=postgresql://rx_ledger@host:5432/rx_ledger  store records in Postgres; the password goes in
+#                       /var/lib/rx-ledger/.pgpass (owner rxledger, mode 600). Kept across reinstalls.
 set -euo pipefail
 
 APP=/opt/rx-ledger
@@ -56,6 +58,7 @@ install -m 644 "$SRC/server.py" "$SRC/logger_utils.py" "$SRC/index.html" "$APP/"
 [ -f "$SRC/seed.json" ] && install -m 640 -o root -g rxledger "$SRC/seed.json" "$APP/seed.json"
 
 # --- service ---------------------------------------------------------------
+DBURL="${RX_DATABASE_URL-$(sed -n 's/^Environment=RX_DATABASE_URL=//p' /etc/systemd/system/$SVC.service 2>/dev/null)}"
 cat > /etc/systemd/system/$SVC.service <<UNIT
 [Unit]
 Description=RockawayX liquid book ledger (VPN only)
@@ -69,6 +72,8 @@ Environment=RX_HOST=$HOST
 Environment=RX_PORT=$PORT
 Environment=RX_DATA_DIR=$DATA
 Environment=RX_ALLOWED_HOSTS=$EXTRA
+Environment=RX_DATABASE_URL=$DBURL
+Environment=PGPASSFILE=$DATA/.pgpass
 Environment=SCRIPT_OWNER=$OWNER
 Environment=LOG_MODE=journal
 Environment=LOG_INSTANCE=$INSTANCE

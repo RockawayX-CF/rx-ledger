@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""RockawayX liquid book ledger: serves the page and stores its documents in SQLite.
+"""RockawayX liquid book ledger: serves the page and stores its documents in SQLite or Postgres.
 
 Loads a local .env if present. Binds to RX_HOST (meant to be the VPN address, e.g. the Tailscale IP),
 so nothing is reachable from the public internet. No login: the VPN is the access control.
+Storage is SQLite in RX_DATA_DIR unless RX_DATABASE_URL points at a Postgres database.
 
 API (all JSON):
   GET    /api/data                  every document, {collection: {id: data}}
@@ -30,41 +31,143 @@ ID_RE = re.compile(r"^[A-Za-z0-9_\-.~:@+]{1,200}$")
 MAX_BODY = 256 * 1024
 
 _db_lock = threading.Lock()
+_store = None
 
 
 def configure():
-    global HOST, PORT, DATA_DIR, EXTRA_HOSTS
+    global HOST, PORT, DATA_DIR, EXTRA_HOSTS, DATABASE_URL
 
     HOST = os.environ.get("RX_HOST", "127.0.0.1")
     PORT = int(os.environ.get("RX_PORT", "8787"))
     DATA_DIR = Path(os.environ.get("RX_DATA_DIR", "./data"))
+    # e.g. postgresql://rx_ledger@10.137.203.1:5432/rx_ledger ; empty means SQLite in DATA_DIR
+    DATABASE_URL = os.environ.get("RX_DATABASE_URL", "").strip()
+    if DATABASE_URL and not DATABASE_URL.startswith(("postgresql://", "postgres://")):
+        raise ValueError("RX_DATABASE_URL must start with postgresql://")
     # Extra hostnames the page may be opened under (e.g. the Tailscale MagicDNS name), comma-separated.
     EXTRA_HOSTS = {h.strip().lower() for h in os.environ.get("RX_ALLOWED_HOSTS", "").split(",") if h.strip()}
 
 
+class SqliteStore:
+    """Default: one SQLite file in RX_DATA_DIR."""
+    kind = "sqlite"
+
+    def __init__(self, path):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS docs (coll TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY (coll, id))")
+        self.conn.commit()
+
+    def count(self):
+        return self.conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+
+    def rows(self):
+        return [(c, i, json.loads(d)) for c, i, d in self.conn.execute("SELECT coll, id, data FROM docs")]
+
+    def get(self, coll, doc_id):
+        row = self.conn.execute("SELECT data FROM docs WHERE coll=? AND id=?", (coll, doc_id)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def put(self, coll, doc_id, body):
+        self.conn.execute("INSERT OR REPLACE INTO docs VALUES (?,?,?,?)", (coll, doc_id, json.dumps(body), time.time()))
+        self.conn.commit()
+
+    def delete(self, coll, doc_id):
+        self.conn.execute("DELETE FROM docs WHERE coll=? AND id=?", (coll, doc_id))
+        self.conn.commit()
+
+    def backup(self, bdir, stem):
+        target = bdir / (stem + ".db")
+        dst = sqlite3.connect(target)
+        self.conn.backup(dst)
+        dst.close()
+        return target
+
+
+class PostgresStore:
+    """Used when RX_DATABASE_URL is set. The password comes from ~/.pgpass or PGPASSWORD, not the URL."""
+    kind = "postgres"
+
+    def __init__(self, url):
+        import psycopg  # only needed for Postgres deployments
+        self.pg, self.url, self.conn = psycopg, url, None
+        self._run(lambda c: c.execute(
+            "CREATE TABLE IF NOT EXISTS docs (coll text NOT NULL, id text NOT NULL, data jsonb NOT NULL, "
+            "updated timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (coll, id))"))
+
+    def _run(self, fn):
+        # One connection, used under _db_lock. Reconnect once if the database restarted or the link dropped;
+        # every statement here is safe to repeat.
+        for attempt in (1, 2):
+            try:
+                if self.conn is None or self.conn.closed:
+                    self.conn = self.pg.connect(self.url, autocommit=True, connect_timeout=10, application_name="rx-ledger")
+                return fn(self.conn)
+            except self.pg.OperationalError:
+                if self.conn is not None:
+                    try:
+                        self.conn.close()
+                    except Exception:
+                        pass
+                self.conn = None
+                if attempt == 2:
+                    raise
+                log.bind(event="database_reconnect").warning("Lost the Postgres connection, reconnecting")
+
+    def count(self):
+        return self._run(lambda c: c.execute("SELECT COUNT(*) FROM docs").fetchone()[0])
+
+    def rows(self):
+        return self._run(lambda c: c.execute("SELECT coll, id, data FROM docs").fetchall())
+
+    def get(self, coll, doc_id):
+        row = self._run(lambda c: c.execute("SELECT data FROM docs WHERE coll=%s AND id=%s", (coll, doc_id)).fetchone())
+        return row[0] if row else None
+
+    def put(self, coll, doc_id, body):
+        self._run(lambda c: c.execute(
+            "INSERT INTO docs (coll, id, data, updated) VALUES (%s, %s, %s::jsonb, now()) "
+            "ON CONFLICT (coll, id) DO UPDATE SET data = EXCLUDED.data, updated = now()",
+            (coll, doc_id, json.dumps(body))))
+
+    def delete(self, coll, doc_id):
+        self._run(lambda c: c.execute("DELETE FROM docs WHERE coll=%s AND id=%s", (coll, doc_id)))
+
+    def backup(self, bdir, stem):
+        # A JSON snapshot of every document, readable without Postgres; tools/load-postgres.py loads it back.
+        target = bdir / (stem + ".json")
+        out = {}
+        for coll, doc_id, data in self.rows():
+            out.setdefault(coll, {})[doc_id] = data
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(json.dumps(out, indent=1, sort_keys=True))
+        tmp.replace(target)
+        return target
+
+
 def open_database():
-    global _db
+    global _store
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _db = sqlite3.connect(DATA_DIR / "ledger.db", check_same_thread=False)
-    _db.execute("PRAGMA journal_mode=WAL")
-    _db.execute("CREATE TABLE IF NOT EXISTS docs (coll TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY (coll, id))")
-    _db.commit()
+    if DATABASE_URL:
+        _store = PostgresStore(DATABASE_URL)
+    else:
+        _store = SqliteStore(DATA_DIR / "ledger.db")
+    log.bind(event="database_opened", backend=_store.kind, document_count=_store.count()).info(
+        "Ledger storage: {}", _store.kind)
 
 
 def import_seed():
     """First start only: load seed.json if the database is empty."""
     seed = APP_DIR / "seed.json"
     with _db_lock:
-        if _db.execute("SELECT COUNT(*) FROM docs").fetchone()[0] or not seed.exists():
+        if _store.count() or not seed.exists():
             return
         data = json.loads(seed.read_text())
-        now = time.time()
         for coll, docs in data.items():
             if coll in COLLECTIONS:
                 for doc_id, body in docs.items():
-                    _db.execute("INSERT INTO docs VALUES (?,?,?,?)", (coll, doc_id, json.dumps(body), now))
-        _db.commit()
+                    _store.put(coll, doc_id, body)
         count = sum(len(docs) for coll, docs in data.items() if coll in COLLECTIONS)
         log.bind(event="seed_imported", document_count=count).info("Imported seed.json: {} documents", count)
 
@@ -72,33 +175,26 @@ def import_seed():
 def all_docs():
     out = {c: {} for c in COLLECTIONS}
     with _db_lock:
-        for coll, doc_id, data in _db.execute("SELECT coll, id, data FROM docs"):
-            out.setdefault(coll, {})[doc_id] = json.loads(data)
+        for coll, doc_id, data in _store.rows():
+            out.setdefault(coll, {})[doc_id] = data
     return out
-
-
-def get_doc(coll, doc_id):
-    row = _db.execute("SELECT data FROM docs WHERE coll=? AND id=?", (coll, doc_id)).fetchone()
-    return json.loads(row[0]) if row else None
 
 
 def write_doc(coll, doc_id, body, merge=False):
     with _db_lock:
         if merge:
-            current = get_doc(coll, doc_id)
+            current = _store.get(coll, doc_id)
             if current is None:
                 return None
             body = {**current, **body}
-        _db.execute("INSERT OR REPLACE INTO docs VALUES (?,?,?,?)", (coll, doc_id, json.dumps(body), time.time()))
-        _db.commit()
+        _store.put(coll, doc_id, body)
     broadcast({"coll": coll, "id": doc_id, "data": body})
     return body
 
 
 def delete_doc(coll, doc_id):
     with _db_lock:
-        _db.execute("DELETE FROM docs WHERE coll=? AND id=?", (coll, doc_id))
-        _db.commit()
+        _store.delete(coll, doc_id)
     broadcast({"coll": coll, "id": doc_id, "data": None})
 
 
@@ -115,18 +211,17 @@ def broadcast(event):
 
 
 # ---- weekly backups (ISO week, server local time); every copy is kept ----
+# SQLite: a copy of ledger.db. Postgres: a JSON snapshot of every document.
 def backup_loop():
     try:
         bdir = DATA_DIR / "backups"
         bdir.mkdir(exist_ok=True)
         while True:
-            target = bdir / time.strftime("ledger-%G-W%V.db")
-            if not target.exists():
+            stem = time.strftime("ledger-%G-W%V")
+            if not any((bdir / (stem + ext)).exists() for ext in (".db", ".json")):
                 with _db_lock:
-                    dst = sqlite3.connect(target)
-                    _db.backup(dst)
-                    dst.close()
-                log.bind(event="backup_completed").info("Weekly ledger backup completed")
+                    target = _store.backup(bdir, stem)
+                log.bind(event="backup_completed", backup_file=target.name).info("Weekly ledger backup completed")
             else:
                 log.bind(event="process_heartbeat").info("Ledger backup worker is running")
             time.sleep(3600)
