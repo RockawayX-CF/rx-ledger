@@ -142,8 +142,10 @@ Postgres instead; the page, API and live updates work the same. The server creat
      .venv/bin/python tools/load-postgres.py ~/.local/share/rx-ledger/data/ledger.db
    ```
 
-4. Add `RX_DATABASE_URL=postgresql://rx_ledger@10.137.203.1:5432/rx_ledger` to the ledger's env file,
-   update the virtual environment from `requirements.txt` and start the ledger. The start-up log
+4. Rerun the installer with the URL, which also installs the Postgres driver and restarts the ledger:
+   `RX_DATABASE_URL=postgresql://rx_ledger@10.137.203.1:5432/rx_ledger SCRIPT_OWNER=<owner> ./install-user.sh`
+   (later reinstalls keep the URL). For `install.sh` the password file is `/var/lib/rx-ledger/.pgpass`,
+   owned by `rxledger`. For a screen launch, add the URL to `.env` and restart. The start-up log
    line `Ledger storage: postgres` confirms it. `ledger.db` is left untouched as a fallback:
    removing `RX_DATABASE_URL` switches back to it (edits made in Postgres meanwhile are not in it).
 

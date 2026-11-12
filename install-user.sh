@@ -24,11 +24,14 @@ python3 -m venv "$APP/.venv"
 "$PY" -m pip install -r "$SRC/requirements.txt"
 install -m 644 "$SRC/server.py" "$SRC/logger_utils.py" "$SRC/index.html" "$APP/"
 [ -f "$SRC/seed.json" ] && install -m 600 "$SRC/seed.json" "$APP/seed.json"
+# Keep Postgres storage across reinstalls: take RX_DATABASE_URL from the environment, else from the current env file.
+DBURL="${RX_DATABASE_URL-$(sed -n 's/^RX_DATABASE_URL=//p' "$APP/env" 2>/dev/null)}"
 cat > "$APP/env" <<ENV
 RX_HOST=$HOST
 RX_PORT=$PORT
 RX_DATA_DIR=$DATA
 RX_ALLOWED_HOSTS=$EXTRA
+RX_DATABASE_URL=$DBURL
 SCRIPT_OWNER=$OWNER
 LOG_INSTANCE=$INSTANCE
 ENV
