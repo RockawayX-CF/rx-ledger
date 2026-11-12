@@ -11,7 +11,7 @@ server's database. `seed.json` and `perf-history.json` are git-ignored on purpos
 
 ```
 browser ──GET /──────────────► server.py ──► index.html  (re-read on every request)
-        ──GET /api/data──────►           ──► data/ledger.db  (SQLite, every record)
+        ──GET /api/data──────►           ──► data/ledger.db  (SQLite, every record; or Postgres, see below)
         ──PUT/DELETE /api/doc►           ──► writes one record, then tells every open tab
         ◄─GET /api/events (SSE)─          (live updates)
 ```
@@ -23,8 +23,9 @@ browser ──GET /──────────────► server.py ─�
   (`perf-YYYY-MM`) and notes (`note-<id>`).
 - The server answers only requests addressed to its own host name/IP (`RX_HOST`, `RX_ALLOWED_HOSTS`),
   which blocks DNS-rebinding pages. There is no login: keep it on a VPN-only address.
-- Weekly backups to `data/backups/ledger-YYYY-Www.db` (ISO week), taken in the first hour the server runs
-  each week. Every backup is kept; nothing is deleted automatically.
+- Weekly backups to `data/backups/` (ISO week), taken in the first hour the server runs each week:
+  `ledger-YYYY-Www.db` on SQLite, `ledger-YYYY-Www.json` (every document) on Postgres.
+  Every backup is kept; nothing is deleted automatically.
 
 ## Layout
 
@@ -35,9 +36,10 @@ browser ──GET /──────────────► server.py ─�
 | `page/ledger.html` | Page source (same page as the claude.ai version) |
 | `page/shim.js` | Small adapter that points the page at `server.py` |
 | `build.py` | `page/` → `index.html` (also strips the wallet-address field) |
-| `requirements.txt` | Logging and local `.env` dependencies |
+| `requirements.txt` | Logging, local `.env` and Postgres driver dependencies |
 | `install-user.sh` | Install without sudo: systemd user service, or cron keep-alive |
 | `install.sh` | Install as root with a systemd service |
+| `tools/load-postgres.py` | Copy `ledger.db` or a JSON snapshot into Postgres (move or restore) |
 | `tools/import-history.py` | One-off load of NAV + benchmark history into the database |
 
 ## Run in screen
@@ -113,6 +115,40 @@ NAV and benchmark history (once per database; safe to repeat, values typed in th
 ```bash
 python3 tools/import-history.py ~/perf-history.json
 ```
+
+## Postgres storage
+
+By default the ledger keeps its records in `data/ledger.db`. Set `RX_DATABASE_URL` to keep them in
+Postgres instead; the page, API and live updates work the same. The server creates its one table
+(`docs`: collection, id, `jsonb` data, last update) on first start.
+
+1. Create the database and a login for it (run as a Postgres admin):
+
+   ```sql
+   CREATE ROLE rx_ledger LOGIN PASSWORD '<choose one>';
+   CREATE DATABASE rx_ledger OWNER rx_ledger;
+   ```
+
+2. On the ledger server, store the password in `~/.pgpass` (not in `.env` or the URL):
+
+   ```sh
+   echo '10.137.203.1:5432:rx_ledger:rx_ledger:<password>' >> ~/.pgpass && chmod 600 ~/.pgpass
+   ```
+
+3. Stop the ledger, then copy the existing records across:
+
+   ```sh
+   RX_DATABASE_URL=postgresql://rx_ledger@10.137.203.1:5432/rx_ledger \
+     .venv/bin/python tools/load-postgres.py ~/.local/share/rx-ledger/data/ledger.db
+   ```
+
+4. Add `RX_DATABASE_URL=postgresql://rx_ledger@10.137.203.1:5432/rx_ledger` to the ledger's env file,
+   update the virtual environment from `requirements.txt` and start the ledger. The start-up log
+   line `Ledger storage: postgres` confirms it. `ledger.db` is left untouched as a fallback:
+   removing `RX_DATABASE_URL` switches back to it (edits made in Postgres meanwhile are not in it).
+
+To restore a weekly snapshot: stop the ledger, then
+`tools/load-postgres.py data/backups/ledger-YYYY-Www.json --replace`.
 
 ## Update
 
