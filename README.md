@@ -40,6 +40,7 @@ browser ──GET /──────────────► server.py ─�
 | `requirements.txt` | Logging, local `.env` and Postgres driver dependencies |
 | `install-user.sh` | Install without sudo: systemd user service, or cron keep-alive |
 | `install.sh` | Install as root with a systemd service |
+| `tools/ledger-at.py` | Ledger at any past moment, or the change history of a record (Postgres) |
 | `tools/load-postgres.py` | Copy `ledger.db` or a JSON snapshot into Postgres (move or restore) |
 | `tools/import-history.py` | One-off load of NAV + benchmark history into the database |
 
@@ -149,6 +150,29 @@ Postgres instead; the page, API and live updates work the same. The server creat
    owned by `rxledger`. For a screen launch, add the URL to `.env` and restart. The start-up log
    line `Ledger storage: postgres` confirms it. `ledger.db` is left untouched as a fallback:
    removing `RX_DATABASE_URL` switches back to it (edits made in Postgres meanwhile are not in it).
+
+### Change history and point-in-time
+
+On Postgres, a database trigger appends every insert, update and delete on `docs` to `docs_history`
+(time, operation, record, the record after the change, and `source`: `rx-ledger` for the page,
+`rx-ledger-load` for loads and restores). Re-saving a record without changes is not recorded.
+History is never edited or deleted, so mistakes and their fixes are both kept. The first start adds one
+`baseline` row per existing record, so history is complete from that moment on.
+
+```sql
+SELECT * FROM ledger_at('2026-11-30 18:00+01');          -- every record as it was then
+
+SELECT d::date AS day, sum((data->>'value')::numeric) AS positions_value   -- end-of-day series
+FROM generate_series('2026-11-13'::date, current_date, '1 day') d,
+     LATERAL ledger_at(d + interval '1 day') WHERE coll = 'positions' GROUP BY 1 ORDER BY 1;
+```
+
+```sh
+.venv/bin/python tools/ledger-at.py "2026-11-30 18:00"                  # summary at that moment
+.venv/bin/python tools/ledger-at.py "2026-11-30 18:00" --out at.json    # restore: load-postgres.py at.json --replace
+.venv/bin/python tools/ledger-at.py --changes positions/p01-bitfinex    # each version, with the fields that changed
+.venv/bin/python tools/ledger-at.py --since "2026-11-25"                # every change since then
+```
 
 To restore a weekly snapshot: stop the ledger, then `tools/load-postgres.py --snapshot YYYY-Www --replace`
 (`--list-snapshots` shows what is stored), or from the file copy:
