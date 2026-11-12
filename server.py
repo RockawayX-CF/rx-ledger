@@ -76,12 +76,15 @@ class SqliteStore:
         self.conn.execute("DELETE FROM docs WHERE coll=? AND id=?", (coll, doc_id))
         self.conn.commit()
 
+    def has_backup(self, bdir, stem):
+        return (bdir / (stem + ".db")).exists()
+
     def backup(self, bdir, stem):
         target = bdir / (stem + ".db")
         dst = sqlite3.connect(target)
         self.conn.backup(dst)
         dst.close()
-        return target
+        return target.name
 
 
 class PostgresStore:
@@ -94,6 +97,10 @@ class PostgresStore:
         self._run(lambda c: c.execute(
             "CREATE TABLE IF NOT EXISTS docs (coll text NOT NULL, id text NOT NULL, data jsonb NOT NULL, "
             "updated timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (coll, id))"))
+        # One row per ISO week, never deleted: the whole ledger as {collection: {id: data}}.
+        self._run(lambda c: c.execute(
+            "CREATE TABLE IF NOT EXISTS snapshots (week text PRIMARY KEY, taken_at timestamptz NOT NULL DEFAULT now(), "
+            "doc_count integer NOT NULL, data jsonb NOT NULL)"))
 
     def _run(self, fn):
         # One connection, used under _db_lock. Reconnect once if the database restarted or the link dropped;
@@ -133,16 +140,27 @@ class PostgresStore:
     def delete(self, coll, doc_id):
         self._run(lambda c: c.execute("DELETE FROM docs WHERE coll=%s AND id=%s", (coll, doc_id)))
 
+    def has_backup(self, bdir, stem):
+        week = stem[len("ledger-"):]
+        return self._run(lambda c: c.execute("SELECT 1 FROM snapshots WHERE week = %s", (week,)).fetchone()) is not None
+
     def backup(self, bdir, stem):
-        # A JSON snapshot of every document, readable without Postgres; tools/load-postgres.py loads it back.
-        target = bdir / (stem + ".json")
+        # The week's snapshot goes into the snapshots table, plus a JSON file on this server as a second copy
+        # on another machine. tools/load-postgres.py restores from either.
+        week = stem[len("ledger-"):]
+        rows = self.rows()
         out = {}
-        for coll, doc_id, data in self.rows():
+        for coll, doc_id, data in rows:
             out.setdefault(coll, {})[doc_id] = data
+        body = json.dumps(out, sort_keys=True)
+        self._run(lambda c: c.execute(
+            "INSERT INTO snapshots (week, doc_count, data) VALUES (%s, %s, %s::jsonb) ON CONFLICT (week) DO NOTHING",
+            (week, len(rows), body)))
+        target = bdir / (stem + ".json")
         tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps(out, indent=1, sort_keys=True))
+        tmp.write_text(body)
         tmp.replace(target)
-        return target
+        return "snapshots/" + week
 
 
 def open_database():
@@ -211,22 +229,24 @@ def broadcast(event):
 
 
 # ---- weekly backups (ISO week, server local time); every copy is kept ----
-# SQLite: a copy of ledger.db. Postgres: a JSON snapshot of every document.
+# SQLite: a copy of ledger.db in RX_DATA_DIR/backups. Postgres: a row in the snapshots table plus a JSON file there.
+# A failed attempt (e.g. Postgres briefly down) is logged and retried at the next hourly check.
 def backup_loop():
-    try:
-        bdir = DATA_DIR / "backups"
-        bdir.mkdir(exist_ok=True)
-        while True:
+    bdir = DATA_DIR / "backups"
+    bdir.mkdir(exist_ok=True)
+    while True:
+        try:
             stem = time.strftime("ledger-%G-W%V")
-            if not any((bdir / (stem + ext)).exists() for ext in (".db", ".json")):
-                with _db_lock:
-                    target = _store.backup(bdir, stem)
-                log.bind(event="backup_completed", backup_file=target.name).info("Weekly ledger backup completed")
+            with _db_lock:
+                done = _store.has_backup(bdir, stem)
+                target = None if done else _store.backup(bdir, stem)
+            if target:
+                log.bind(event="backup_completed", backup_file=target).info("Weekly ledger backup completed")
             else:
                 log.bind(event="process_heartbeat").info("Ledger backup worker is running")
-            time.sleep(3600)
-    except Exception:
-        log.bind(event="backup_failed").exception("Ledger backup worker stopped")
+        except Exception:
+            log.bind(event="backup_failed").exception("Weekly ledger backup failed; retrying in an hour")
+        time.sleep(3600)
 
 
 class Handler(BaseHTTPRequestHandler):
