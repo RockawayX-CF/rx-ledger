@@ -98,5 +98,5 @@ echo
 echo "Ledger is running on http://$HOST:$PORT"
 [ -n "$EXTRA" ] && echo "Allowed hostnames: $EXTRA"
 echo
-echo "Data: $DATA/ledger.db   Daily backups: $DATA/backups (last 30 kept)"
+echo "Data: $DATA/ledger.db   Weekly backups: $DATA/backups (all kept)"
 echo "Logs: journalctl -u $SVC -f"

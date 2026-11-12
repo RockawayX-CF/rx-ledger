@@ -33,14 +33,13 @@ _db_lock = threading.Lock()
 
 
 def configure():
-    global HOST, PORT, DATA_DIR, EXTRA_HOSTS, BACKUP_KEEP
+    global HOST, PORT, DATA_DIR, EXTRA_HOSTS
 
     HOST = os.environ.get("RX_HOST", "127.0.0.1")
     PORT = int(os.environ.get("RX_PORT", "8787"))
     DATA_DIR = Path(os.environ.get("RX_DATA_DIR", "./data"))
     # Extra hostnames the page may be opened under (e.g. the Tailscale MagicDNS name), comma-separated.
     EXTRA_HOSTS = {h.strip().lower() for h in os.environ.get("RX_ALLOWED_HOSTS", "").split(",") if h.strip()}
-    BACKUP_KEEP = int(os.environ.get("RX_BACKUP_KEEP", "30"))
 
 
 def open_database():
@@ -115,21 +114,19 @@ def broadcast(event):
             q.put(msg)
 
 
-# ---- daily backups ----
+# ---- weekly backups (ISO week, server local time); every copy is kept ----
 def backup_loop():
     try:
         bdir = DATA_DIR / "backups"
         bdir.mkdir(exist_ok=True)
         while True:
-            target = bdir / time.strftime("ledger-%Y%m%d.db")
+            target = bdir / time.strftime("ledger-%G-W%V.db")
             if not target.exists():
                 with _db_lock:
                     dst = sqlite3.connect(target)
                     _db.backup(dst)
                     dst.close()
-                for old in sorted(bdir.glob("ledger-*.db"))[:-BACKUP_KEEP]:
-                    old.unlink()
-                log.bind(event="backup_completed").info("Daily ledger backup completed")
+                log.bind(event="backup_completed").info("Weekly ledger backup completed")
             else:
                 log.bind(event="process_heartbeat").info("Ledger backup worker is running")
             time.sleep(3600)
