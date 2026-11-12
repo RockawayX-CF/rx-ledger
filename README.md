@@ -24,7 +24,8 @@ browser ──GET /──────────────► server.py ─�
 - The server answers only requests addressed to its own host name/IP (`RX_HOST`, `RX_ALLOWED_HOSTS`),
   which blocks DNS-rebinding pages. There is no login: keep it on a VPN-only address.
 - Weekly backups to `data/backups/` (ISO week), taken in the first hour the server runs each week:
-  `ledger-YYYY-Www.db` on SQLite, `ledger-YYYY-Www.json` (every document) on Postgres.
+  `ledger-YYYY-Www.db` on SQLite. On Postgres, a row in the `snapshots` table (week, time, document count,
+  every document as `jsonb`) plus `ledger-YYYY-Www.json` on the ledger server as a second copy.
   Every backup is kept; nothing is deleted automatically.
 
 ## Layout
@@ -149,7 +150,8 @@ Postgres instead; the page, API and live updates work the same. The server creat
    line `Ledger storage: postgres` confirms it. `ledger.db` is left untouched as a fallback:
    removing `RX_DATABASE_URL` switches back to it (edits made in Postgres meanwhile are not in it).
 
-To restore a weekly snapshot: stop the ledger, then
+To restore a weekly snapshot: stop the ledger, then `tools/load-postgres.py --snapshot YYYY-Www --replace`
+(`--list-snapshots` shows what is stored), or from the file copy:
 `tools/load-postgres.py data/backups/ledger-YYYY-Www.json --replace`.
 
 ## Update
