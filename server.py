@@ -47,6 +47,14 @@ def configure():
     DATABASE_URL = os.environ.get("RX_DATABASE_URL", "").strip()
     if DATABASE_URL and not DATABASE_URL.startswith(("postgresql://", "postgres://")):
         raise ValueError("RX_DATABASE_URL must start with postgresql://")
+    # How often the automatic snapshot is taken: day (default) or week.
+    global SNAPSHOT_EVERY, PERIOD_FMT, MANUAL_FMT
+    SNAPSHOT_EVERY = os.environ.get("RX_SNAPSHOT_EVERY", "day").strip().lower() or "day"
+    if SNAPSHOT_EVERY not in ("day", "week"):
+        raise ValueError("RX_SNAPSHOT_EVERY must be day or week")
+    # Snapshot ids: daily "2026-11-25", weekly "2026-W48"; on-demand ones add the time, e.g. "2026-11-25.143005".
+    PERIOD_FMT = "%Y-%m-%d" if SNAPSHOT_EVERY == "day" else "%G-W%V"
+    MANUAL_FMT = PERIOD_FMT + (".%H%M%S" if SNAPSHOT_EVERY == "day" else ".%Y%m%d-%H%M%S")
     # Extra hostnames the page may be opened under (e.g. the Tailscale MagicDNS name), comma-separated.
     EXTRA_HOSTS = {h.strip().lower() for h in os.environ.get("RX_ALLOWED_HOSTS", "").split(",") if h.strip()}
 
@@ -158,11 +166,12 @@ class PostgresStore:
         self._run(lambda c: c.execute(
             "CREATE TABLE IF NOT EXISTS docs (coll text NOT NULL, id text NOT NULL, data jsonb NOT NULL, "
             "updated timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (coll, id))"))
-        # One row per ISO week, never deleted: the whole ledger as {collection: {id: data}}.
+        # One row per day (or ISO week, see RX_SNAPSHOT_EVERY), never deleted: the whole ledger as {collection: {id: data}}.
+        # The column is still called "week" so existing tables and tools keep working; it holds the snapshot id.
         self._run(lambda c: c.execute(
             "CREATE TABLE IF NOT EXISTS snapshots (week text PRIMARY KEY, taken_at timestamptz NOT NULL DEFAULT now(), "
             "doc_count integer NOT NULL, data jsonb NOT NULL)"))
-        # On-demand snapshots share the table: id "<ISO week>.<YYYYMMDD-HHMMSS>" plus an optional label.
+        # On-demand snapshots share the table: id "<period>.<time>" plus an optional label.
         self._run(lambda c: c.execute("ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS label text"))
         self._run(lambda c: c.execute(HISTORY_SQL))
 
@@ -210,7 +219,7 @@ class PostgresStore:
         return self._run(lambda c: c.execute("SELECT 1 FROM snapshots WHERE week = %s", (week,)).fetchone()) is not None
 
     def backup(self, bdir, stem, label=None):
-        # The week's snapshot (or an on-demand one) goes into the snapshots table, plus a JSON file on this server as a second copy
+        # The day's/week's snapshot (or an on-demand one) goes into the snapshots table, plus a JSON file on this server as a second copy
         # on another machine. tools/load-postgres.py restores from either.
         week = stem[len("ledger-"):]
         rows = self.rows()
@@ -298,7 +307,8 @@ def broadcast(event):
             q.put(msg)
 
 
-# ---- weekly backups (ISO week, server local time); every copy is kept ----
+# ---- automatic snapshots: daily by default (RX_SNAPSHOT_EVERY=week for weekly), server local time ----
+# Taken in the first hour the server runs each day; every copy is kept.
 # SQLite: a copy of ledger.db in RX_DATA_DIR/backups. Postgres: a row in the snapshots table plus a JSON file there.
 # A failed attempt (e.g. Postgres briefly down) is logged and retried at the next hourly check.
 def backup_loop():
@@ -306,21 +316,21 @@ def backup_loop():
     bdir.mkdir(exist_ok=True)
     while True:
         try:
-            stem = time.strftime("ledger-%G-W%V")
+            stem = "ledger-" + time.strftime(PERIOD_FMT)
             with _db_lock:
                 done = _store.has_backup(bdir, stem)
                 target = None if done else _store.backup(bdir, stem)
             if target:
-                log.bind(event="backup_completed", backup_file=target).info("Weekly ledger backup completed")
+                log.bind(event="backup_completed", backup_file=target).info("Scheduled ledger snapshot completed ({})", SNAPSHOT_EVERY)
             else:
                 log.bind(event="process_heartbeat").info("Ledger backup worker is running")
         except Exception:
-            log.bind(event="backup_failed").exception("Weekly ledger backup failed; retrying in an hour")
+            log.bind(event="backup_failed").exception("Scheduled ledger snapshot failed; retrying in an hour")
         time.sleep(3600)
 
 
 # ---- on-demand snapshots (button in the page, or POST /api/snapshot) ----
-# Same storage as the weekly backup, never replaces it: id "<ISO week>.<YYYYMMDD-HHMMSS>" (server local time).
+# Same storage as the scheduled snapshot, never replaces it: id "<period>.<time>" (server local time).
 _last_manual = 0.0
 
 
@@ -331,7 +341,7 @@ def snapshot_now(label=None):
     with _db_lock:
         if time.time() - _last_manual < 5:
             return None                       # double click: one snapshot is enough
-        sid = time.strftime("%G-W%V.%Y%m%d-%H%M%S")
+        sid = time.strftime(MANUAL_FMT)
         target = _store.backup(bdir, "ledger-" + sid, label)
         _last_manual = time.time()
     log.bind(event="snapshot_completed", backup_file=target, label=label or "").info("On-demand ledger snapshot saved")
@@ -518,6 +528,7 @@ def main() -> int:
             )
             return 2
         open_database()
+        log.bind(event="snapshot_schedule", every=SNAPSHOT_EVERY).info("Automatic snapshots: every {}", SNAPSHOT_EVERY)
         import_seed()
         threading.Thread(target=backup_loop, daemon=True).start()
         with LedgerServer((HOST, PORT), Handler) as httpd:

@@ -51,7 +51,7 @@
 })();
 
 /* Self-hosted only: "Snapshot" button in the header saves the whole ledger now (POST /api/snapshot).
-   Weekly snapshots keep running; on-demand ones are extra rows next to them. */
+   Scheduled (daily) snapshots keep running; on-demand ones are extra rows next to them. */
 document.addEventListener('DOMContentLoaded', () => {
   const box = document.querySelector('header .status'); if (!box) return;
   const btn = document.createElement('button');

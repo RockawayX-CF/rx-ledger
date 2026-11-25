@@ -2,11 +2,11 @@
 """Copy ledger documents into the Postgres database named by RX_DATABASE_URL.
 
     python3 tools/load-postgres.py data/ledger.db                     # move from SQLite
-    python3 tools/load-postgres.py data/backups/ledger-2026-W46.json  # restore a weekly JSON snapshot
+    python3 tools/load-postgres.py data/backups/ledger-2026-11-25.json  # restore a daily JSON snapshot
     python3 tools/load-postgres.py SOURCE --replace                   # empty the table first
-    python3 tools/load-postgres.py --snapshot 2026-W46 --replace      # restore a week from the snapshots table
-    python3 tools/load-postgres.py --list-snapshots                   # show stored snapshots (weekly + on-demand)
-    python3 tools/load-postgres.py --snapshot 2026-W48.20261125-143005 --replace   # restore an on-demand one
+    python3 tools/load-postgres.py --snapshot 2026-11-25 --replace    # restore a day (or an older week, 2026-W46)
+    python3 tools/load-postgres.py --list-snapshots                   # show stored snapshots (scheduled + on-demand)
+    python3 tools/load-postgres.py --snapshot 2026-11-25.143005 --replace          # restore an on-demand one
 
 Stop the ledger server before running it. Without --replace it refuses to write into a table that
 already holds documents. Reads RX_DATABASE_URL from the environment or a .env next to the repo;
@@ -34,8 +34,8 @@ def read_source(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", type=Path, nargs="?", help="ledger.db or a ledger-*.json snapshot")
-    ap.add_argument("--snapshot", metavar="WEEK", help="restore this week (e.g. 2026-W46) from the snapshots table")
-    ap.add_argument("--list-snapshots", action="store_true", help="list stored weekly snapshots and exit")
+    ap.add_argument("--snapshot", metavar="ID", help="restore this snapshot id (e.g. 2026-11-25, 2026-W46) from the snapshots table")
+    ap.add_argument("--list-snapshots", action="store_true", help="list stored snapshots and exit")
     ap.add_argument("--replace", action="store_true", help="delete every document in Postgres first")
     args = ap.parse_args()
 
@@ -57,7 +57,7 @@ def main():
                 print(f"{week:<24}  {taken:%Y-%m-%d %H:%M %Z}  {n:>4} documents  {label or ''}")
         return
     if bool(args.source) == bool(args.snapshot):
-        sys.exit("Give either a SOURCE file or --snapshot WEEK")
+        sys.exit("Give either a SOURCE file or --snapshot ID")
     if args.snapshot:
         with psycopg.connect(url, application_name="rx-ledger-load") as con:
             row = con.execute("SELECT data FROM snapshots WHERE week = %s", (args.snapshot,)).fetchone()
