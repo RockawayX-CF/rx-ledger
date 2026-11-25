@@ -23,10 +23,15 @@ browser ──GET /──────────────► server.py ─�
   (`perf-YYYY-MM`) and notes (`note-<id>`).
 - The server answers only requests addressed to its own host name/IP (`RX_HOST`, `RX_ALLOWED_HOSTS`),
   which blocks DNS-rebinding pages. There is no login: keep it on a VPN-only address.
-- Weekly backups to `data/backups/` (ISO week), taken in the first hour the server runs each week:
-  `ledger-YYYY-Www.db` on SQLite. On Postgres, a row in the `snapshots` table (week, time, document count,
-  every document as `jsonb`) plus `ledger-YYYY-Www.json` on the ledger server as a second copy.
-  Every backup is kept; nothing is deleted automatically.
+- Daily snapshots to `data/backups/`, taken in the first hour the server runs each day (server local time):
+  `ledger-YYYY-MM-DD.db` on SQLite. On Postgres, a row in the `snapshots` table (id, time, document count,
+  every document as `jsonb`) plus `ledger-YYYY-MM-DD.json` on the ledger server as a second copy.
+  Every snapshot is kept; nothing is deleted automatically. `RX_SNAPSHOT_EVERY=week` switches back to
+  one per ISO week (`YYYY-Www`). Snapshots taken before the switch to daily keep their week ids.
+- On-demand snapshots: the **Snapshot** button in the page header (or `POST /api/snapshot` with
+  `{"label": "..."}`) saves the whole ledger right away, in the same places as the daily one.
+  Its id is `<day>.<HHMMSS>` (e.g. `2026-11-25.143005`), so it sits next to that day's snapshot and
+  never replaces it. `GET /api/snapshots` lists what is stored.
 
 ## Layout
 
@@ -174,9 +179,9 @@ FROM generate_series('2026-11-13'::date, current_date, '1 day') d,
 .venv/bin/python tools/ledger-at.py --since "2026-11-25"                # every change since then
 ```
 
-To restore a weekly snapshot: stop the ledger, then `tools/load-postgres.py --snapshot YYYY-Www --replace`
+To restore a snapshot: stop the ledger, then `tools/load-postgres.py --snapshot YYYY-MM-DD --replace`
 (`--list-snapshots` shows what is stored), or from the file copy:
-`tools/load-postgres.py data/backups/ledger-YYYY-Www.json --replace`.
+`tools/load-postgres.py data/backups/ledger-YYYY-MM-DD.json --replace`.
 
 ## Update
 
@@ -206,10 +211,11 @@ SCRIPT_OWNER=your-owner RX_HOST=127.0.0.1 RX_DATA_DIR=/tmp/rx python3 server.py
 | Logs | Read the journal for a service or the instance’s JSONL files for screen and cron |
 | Restart | `pkill -f '.local/share/rx-ledger/[s]erver.py'` (cron starts it within a minute) |
 | Copy of the database | `cp ~/.local/share/rx-ledger/data/ledger.db ~/ledger-$(date +%F).db` |
-| Restore a backup | stop it as above, then `cp data/backups/ledger-YYYY-Www.db data/ledger.db && rm -f data/ledger.db-wal data/ledger.db-shm` (in `~/.local/share/rx-ledger`); cron restarts it |
+| Restore a backup | stop it as above, then `cp data/backups/ledger-YYYY-MM-DD.db data/ledger.db && rm -f data/ledger.db-wal data/ledger.db-shm` (in `~/.local/share/rx-ledger`); cron restarts it |
 
 Kept per browser only (not on the server): scenarios, loop calculators, whether the time series is open.
 
 ## API
 
-`GET /api/data` · `PUT|PATCH|DELETE /api/doc/<positions|loans|plans|settings>/<id>` · `GET /api/events` (SSE)
+`GET /api/data` · `PUT|PATCH|DELETE /api/doc/<positions|loans|plans|settings>/<id>` · `GET /api/events` (SSE) ·
+`POST /api/snapshot` · `GET /api/snapshots`
