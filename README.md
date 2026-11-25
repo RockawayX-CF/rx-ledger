@@ -27,6 +27,10 @@ browser ──GET /──────────────► server.py ─�
   `ledger-YYYY-Www.db` on SQLite. On Postgres, a row in the `snapshots` table (week, time, document count,
   every document as `jsonb`) plus `ledger-YYYY-Www.json` on the ledger server as a second copy.
   Every backup is kept; nothing is deleted automatically.
+- On-demand snapshots: the **Snapshot** button in the page header (or `POST /api/snapshot` with
+  `{"label": "..."}`) saves the whole ledger right away, in the same places as the weekly backup.
+  Its id is `<ISO week>.<YYYYMMDD-HHMMSS>` (e.g. `2026-W48.20261125-143005`), so it sits next to that week's
+  backup and never replaces it. `GET /api/snapshots` lists what is stored.
 
 ## Layout
 
@@ -212,4 +216,5 @@ Kept per browser only (not on the server): scenarios, loop calculators, whether 
 
 ## API
 
-`GET /api/data` · `PUT|PATCH|DELETE /api/doc/<positions|loans|plans|settings>/<id>` · `GET /api/events` (SSE)
+`GET /api/data` · `PUT|PATCH|DELETE /api/doc/<positions|loans|plans|settings>/<id>` · `GET /api/events` (SSE) ·
+`POST /api/snapshot` · `GET /api/snapshots`

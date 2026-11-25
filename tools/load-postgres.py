@@ -5,7 +5,8 @@
     python3 tools/load-postgres.py data/backups/ledger-2026-W46.json  # restore a weekly JSON snapshot
     python3 tools/load-postgres.py SOURCE --replace                   # empty the table first
     python3 tools/load-postgres.py --snapshot 2026-W46 --replace      # restore a week from the snapshots table
-    python3 tools/load-postgres.py --list-snapshots                   # show stored weekly snapshots
+    python3 tools/load-postgres.py --list-snapshots                   # show stored snapshots (weekly + on-demand)
+    python3 tools/load-postgres.py --snapshot 2026-W48.20261125-143005 --replace   # restore an on-demand one
 
 Stop the ledger server before running it. Without --replace it refuses to write into a table that
 already holds documents. Reads RX_DATABASE_URL from the environment or a .env next to the repo;
@@ -49,8 +50,11 @@ def main():
 
     if args.list_snapshots:
         with psycopg.connect(url, application_name="rx-ledger-load") as con:
-            for week, taken, n in con.execute("SELECT week, taken_at, doc_count FROM snapshots ORDER BY week"):
-                print(f"{week}  {taken:%Y-%m-%d %H:%M %Z}  {n} documents")
+            has_label = con.execute("SELECT 1 FROM information_schema.columns WHERE table_name='snapshots' "
+                                    "AND column_name='label'").fetchone()
+            q = "SELECT week, taken_at, doc_count, " + ("label" if has_label else "NULL") + " FROM snapshots ORDER BY taken_at"
+            for week, taken, n, label in con.execute(q):
+                print(f"{week:<24}  {taken:%Y-%m-%d %H:%M %Z}  {n:>4} documents  {label or ''}")
         return
     if bool(args.source) == bool(args.snapshot):
         sys.exit("Give either a SOURCE file or --snapshot WEEK")

@@ -49,6 +49,32 @@
   ready = load().then(connect).catch(() => { connect(); });
   window.claude = Object.freeze({ use: async name => name === 'db' ? db : name === 'user' ? user : null });
 })();
+
+/* Self-hosted only: "Snapshot" button in the header saves the whole ledger now (POST /api/snapshot).
+   Weekly snapshots keep running; on-demand ones are extra rows next to them. */
+document.addEventListener('DOMContentLoaded', () => {
+  const box = document.querySelector('header .status'); if (!box) return;
+  const btn = document.createElement('button');
+  btn.type = 'button'; btn.className = 'btn'; btn.textContent = 'Snapshot';
+  btn.title = 'Save a snapshot of the whole ledger now';
+  const note = document.createElement('span'); note.className = 'faint'; note.setAttribute('role', 'status');
+  const hhmm = t => new Date(t).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  fetch('/api/snapshots', {cache:'no-store'}).then(r => r.ok ? r.json() : []).then(l => {
+    if (l[0]) note.textContent = 'Last ' + new Date(l[0].taken_at).toLocaleDateString() + ' ' + hhmm(l[0].taken_at);
+  }).catch(() => {});
+  btn.addEventListener('click', async () => {
+    const label = prompt('Label for this snapshot (optional), e.g. "before Bastion roll":', '');
+    if (label === null) return;
+    btn.disabled = true; note.textContent = 'Saving…';
+    try {
+      const r = await fetch('/api/snapshot', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({label})});
+      const j = await r.json().catch(() => ({}));
+      note.textContent = r.ok ? 'Saved ' + hhmm(Date.now()) + ' (' + j.id + ')' : (j.error || 'Snapshot failed (' + r.status + ')');
+    } catch (e) { note.textContent = 'Snapshot failed: server unreachable'; }
+    finally { setTimeout(() => { btn.disabled = false; }, 5000); }
+  });
+  box.prepend(note); box.prepend(btn);
+});
 </script></head><body><title>Liquid Book Positions</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">

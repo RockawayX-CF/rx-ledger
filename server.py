@@ -11,8 +11,11 @@ API (all JSON):
   PATCH  /api/doc/<coll>/<id>       merge top-level fields into a document
   DELETE /api/doc/<coll>/<id>       delete a document
   GET    /api/events                server-sent events, one per change: {"coll", "id", "data" | null}
+  POST   /api/snapshot              save a snapshot now, body {"label": "..."} optional
+  GET    /api/snapshots             stored snapshots, newest first (no data, just id/time/label/count)
 """
 import json, os, queue, re, sqlite3, sys, threading, time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -79,12 +82,22 @@ class SqliteStore:
     def has_backup(self, bdir, stem):
         return (bdir / (stem + ".db")).exists()
 
-    def backup(self, bdir, stem):
+    def backup(self, bdir, stem, label=None):
         target = bdir / (stem + ".db")
         dst = sqlite3.connect(target)
         self.conn.backup(dst)
         dst.close()
+        if label:
+            (bdir / (stem + ".label")).write_text(label)
         return target.name
+
+    def list_snapshots(self, bdir, limit):
+        out = []
+        for f in sorted(bdir.glob("ledger-*.db"), key=lambda f: f.stat().st_mtime, reverse=True)[:limit]:
+            lab = f.with_suffix(".label")
+            out.append({"id": f.stem[len("ledger-"):], "taken_at": datetime.fromtimestamp(f.stat().st_mtime).astimezone().isoformat(),
+                        "label": lab.read_text() if lab.exists() else None, "doc_count": None})
+        return out
 
 
 # Change history (Postgres only): a trigger appends every insert, update and delete on docs to docs_history,
@@ -149,6 +162,8 @@ class PostgresStore:
         self._run(lambda c: c.execute(
             "CREATE TABLE IF NOT EXISTS snapshots (week text PRIMARY KEY, taken_at timestamptz NOT NULL DEFAULT now(), "
             "doc_count integer NOT NULL, data jsonb NOT NULL)"))
+        # On-demand snapshots share the table: id "<ISO week>.<YYYYMMDD-HHMMSS>" plus an optional label.
+        self._run(lambda c: c.execute("ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS label text"))
         self._run(lambda c: c.execute(HISTORY_SQL))
 
 
@@ -194,8 +209,8 @@ class PostgresStore:
         week = stem[len("ledger-"):]
         return self._run(lambda c: c.execute("SELECT 1 FROM snapshots WHERE week = %s", (week,)).fetchone()) is not None
 
-    def backup(self, bdir, stem):
-        # The week's snapshot goes into the snapshots table, plus a JSON file on this server as a second copy
+    def backup(self, bdir, stem, label=None):
+        # The week's snapshot (or an on-demand one) goes into the snapshots table, plus a JSON file on this server as a second copy
         # on another machine. tools/load-postgres.py restores from either.
         week = stem[len("ledger-"):]
         rows = self.rows()
@@ -204,13 +219,18 @@ class PostgresStore:
             out.setdefault(coll, {})[doc_id] = data
         body = json.dumps(out, sort_keys=True)
         self._run(lambda c: c.execute(
-            "INSERT INTO snapshots (week, doc_count, data) VALUES (%s, %s, %s::jsonb) ON CONFLICT (week) DO NOTHING",
-            (week, len(rows), body)))
+            "INSERT INTO snapshots (week, doc_count, data, label) VALUES (%s, %s, %s::jsonb, %s) ON CONFLICT (week) DO NOTHING",
+            (week, len(rows), body, label)))
         target = bdir / (stem + ".json")
         tmp = target.with_suffix(".tmp")
         tmp.write_text(body)
         tmp.replace(target)
         return "snapshots/" + week
+
+    def list_snapshots(self, bdir, limit):
+        rows = self._run(lambda c: c.execute(
+            "SELECT week, taken_at, doc_count, label FROM snapshots ORDER BY taken_at DESC LIMIT %s", (limit,)).fetchall())
+        return [{"id": w, "taken_at": t.isoformat(), "doc_count": n, "label": lab} for w, t, n, lab in rows]
 
 
 def open_database():
@@ -299,6 +319,30 @@ def backup_loop():
         time.sleep(3600)
 
 
+# ---- on-demand snapshots (button in the page, or POST /api/snapshot) ----
+# Same storage as the weekly backup, never replaces it: id "<ISO week>.<YYYYMMDD-HHMMSS>" (server local time).
+_last_manual = 0.0
+
+
+def snapshot_now(label=None):
+    global _last_manual
+    bdir = DATA_DIR / "backups"
+    bdir.mkdir(exist_ok=True)
+    with _db_lock:
+        if time.time() - _last_manual < 5:
+            return None                       # double click: one snapshot is enough
+        sid = time.strftime("%G-W%V.%Y%m%d-%H%M%S")
+        target = _store.backup(bdir, "ledger-" + sid, label)
+        _last_manual = time.time()
+    log.bind(event="snapshot_completed", backup_file=target, label=label or "").info("On-demand ledger snapshot saved")
+    return {"id": sid, "target": target, "label": label}
+
+
+def list_snapshots(limit=50):
+    with _db_lock:
+        return _store.list_snapshots(DATA_DIR / "backups", limit)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "rx-ledger"
     protocol_version = "HTTP/1.1"
@@ -353,6 +397,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, all_docs())
         if path == "/api/events":
             return self.stream()
+        if path == "/api/snapshots":
+            return self.send_json(200, list_snapshots())
         self.send_json(404, {"error": "not found"})
 
     def stream(self):
@@ -400,6 +446,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         self.write(merge=True)
+
+    def do_POST(self):
+        if not self.host_ok():
+            return self.send_json(403, {"error": "unknown host"})
+        if self.path.split("?")[0] != "/api/snapshot":
+            return self.send_json(404, {"error": "not found"})
+        # JSON only: a cross-site form can't send it without a CORS preflight, which this server never grants.
+        if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+            return self.send_json(415, {"error": "send Content-Type: application/json"})
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.read_body() if length else {}
+        if body is None:
+            return self.send_json(400, {"error": "body must be a JSON object"})
+        label = str(body.get("label") or "").strip()[:200] or None
+        try:
+            result = snapshot_now(label)
+        except Exception:
+            log.bind(event="snapshot_failed").exception("On-demand ledger snapshot failed")
+            return self.send_json(500, {"error": "snapshot failed, see the server log"})
+        if result is None:
+            return self.send_json(429, {"error": "a snapshot was just taken"})
+        self.send_json(200, {"ok": True, **result})
 
     def do_DELETE(self):
         if not self.host_ok():
